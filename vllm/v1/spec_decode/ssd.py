@@ -151,15 +151,17 @@ class AsyncSSDProposer:
         dist_init_addr = f"127.0.0.1:{_port}"
         _timeout = datetime.timedelta(seconds=300)
 
-        # 2. Create the TCPStore on the target side (master=True) BEFORE
-        #    spawning the draft process so the store is already listening
-        #    when the draft tries to connect.
+        # 2. Create the TCPStore on the target side (master=True).
+        #    wait_for_workers=False is critical: the default (True) blocks
+        #    until world_size workers join, but the draft process hasn't
+        #    been spawned yet, so it would time out immediately.
         _store = TCPStore(
             host_name="127.0.0.1",
             port=_port,
             world_size=2,
             is_master=True,
             timeout=_timeout,
+            wait_for_workers=False,
         )
 
         # 3. Spawn the draft process.  It will call dist.init_process_group
