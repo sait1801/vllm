@@ -677,19 +677,36 @@ def _draft_worker_entrypoint(
     dist_init_addr:
         ``"host:port"`` rendezvous address.
     """
-    os.environ.setdefault("MASTER_ADDR", dist_init_addr.split(":")[0])
-    os.environ.setdefault("MASTER_PORT", dist_init_addr.split(":")[1])
+    # Build the same ProcessGroupNCCL the target builds (rank=0), but as rank=1.
+    # Both sides must use PrefixStore("", ...) so that the NCCL unique-ID
+    # rendezvous keys are identical.  Using dist.init_process_group here would
+    # create a PrefixStore with a different internal prefix, causing NCCL to
+    # exchange keys on different store entries and never establish the
+    # communicator (manifesting as a segfault on the first P2P op).
+    import datetime
 
-    dist.init_process_group(
-        backend="nccl",
-        init_method=f"tcp://{dist_init_addr}",
+    from torch.distributed import TCPStore
+    from torch.distributed.distributed_c10d import PrefixStore, ProcessGroupNCCL
+
+    _host, _port_str = dist_init_addr.rsplit(":", 1)
+    _timeout = datetime.timedelta(seconds=300)
+    _store = TCPStore(
+        host_name=_host,
+        port=int(_port_str),
         world_size=2,
-        rank=1,  # draft is always rank 1 in the private SSD group
+        is_master=False,  # target (rank 0) is the TCPStore master
+        timeout=_timeout,
+    )
+    async_pg = ProcessGroupNCCL(
+        PrefixStore("", _store),
+        rank=1,  # draft is always rank 1
+        size=2,
+        timeout=_timeout,
     )
 
     worker = AsyncDraftWorker(
         bootstrap=bootstrap,
         init_q=init_q,
-        async_pg=None,  # None = use the default private 2-rank group
+        async_pg=async_pg,
     )
     worker.draft_loop()
