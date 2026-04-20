@@ -4246,7 +4246,7 @@ class GPUModelRunner(
                 spec_config.use_eagle()
                 or spec_config.uses_draft_model()
                 or spec_config.uses_extract_hidden_states()
-            ) and not spec_config.disable_padded_drafter_batch
+            ) and not spec_config.disable_padded_drafter_batch and not spec_config.draft_async
             if use_gpu_toks:
                 # EAGLE/DraftModel speculative decoding can use the GPU sampled tokens
                 # as inputs, and does not need to wait for bookkeeping to finish.
@@ -4650,7 +4650,7 @@ class GPUModelRunner(
             spec_config.use_eagle()
             or spec_config.use_dflash()
             or spec_config.uses_draft_model()
-        ):
+        ) and not spec_config.draft_async:
             assert isinstance(
                 self.drafter, EagleProposer | DFlashProposer | DraftModelProposer
             )
@@ -5692,7 +5692,7 @@ class GPUModelRunner(
             else:
                 hidden_states = outputs
 
-            if self.speculative_config and (
+            if self.speculative_config and not self.speculative_config.draft_async and (
                 self.speculative_config.use_eagle()
                 or self.speculative_config.uses_draft_model()
                 or self.speculative_config.uses_extract_hidden_states()
@@ -6466,7 +6466,7 @@ class GPUModelRunner(
         self.calculate_reorder_batch_threshold()
 
         # Initialize drafter attention backend
-        if self.speculative_config and (
+        if self.speculative_config and not self.speculative_config.draft_async and (
             self.speculative_config.use_eagle()
             or self.speculative_config.uses_draft_model()
         ):
