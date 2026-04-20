@@ -107,6 +107,14 @@ class AsyncSSDProposer:
     # Lifecycle
     # ------------------------------------------------------------------
 
+    def load_model(self, target_model: object) -> None:
+        """No-op: AsyncSSDProposer loads its model in a separate process.
+
+        The draft model is loaded inside ``AsyncDraftWorker`` (child process)
+        during :meth:`spawn_draft_worker`.  The target model reference is not
+        needed on the proposer side.
+        """
+
     def spawn_draft_worker(
         self,
         dist_init_addr: str,
