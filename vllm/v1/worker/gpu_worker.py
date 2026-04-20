@@ -546,6 +546,11 @@ class Worker(WorkerBase):
         ):
             self.model_runner._init_kv_zero_meta()
 
+        # Spawn the SSD draft worker now that KV cache is ready.
+        # This is a no-op unless speculative_config.draft_async=True.
+        if hasattr(self.model_runner, "init_ssd_draft_worker"):
+            self.model_runner.init_ssd_draft_worker()
+
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
         warmup_sizes: list[int] = []

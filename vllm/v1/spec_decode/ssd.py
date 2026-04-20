@@ -115,24 +115,18 @@ class AsyncSSDProposer:
         needed on the proposer side.
         """
 
-    def spawn_draft_worker(
-        self,
-        dist_init_addr: str,
-        world_size: int,
-        draft_rank: int,
-    ) -> int:
+    def spawn_draft_worker(self) -> int:
         """Spawn the draft worker process and return its kv-block count.
 
-        This must be called once before :meth:`propose` or :meth:`prefill`.
+        This must be called once after KV cache initialization, before the
+        first call to :meth:`propose` or :meth:`prefill`.  The rendezvous
+        address and NCCL process group are created internally; no external
+        distributed addresses need to be supplied.
 
-        Parameters
-        ----------
-        dist_init_addr:
-            ``"host:port"`` used for ``torch.distributed.init_process_group``.
-        world_size:
-            Total number of distributed ranks (target ranks + 1 draft rank).
-        draft_rank:
-            The rank assigned to the draft worker (always ``world_size - 1``).
+        We create the private 2-rank NCCL group via ``TCPStore +
+        ProcessGroupNCCL`` directly rather than calling
+        ``dist.init_process_group`` again (vLLM already initialised the
+        default group; calling it twice raises an error).
 
         Returns
         -------
@@ -140,59 +134,71 @@ class AsyncSSDProposer:
             Number of KV cache blocks allocated by the draft worker, for use
             by the target's block manager.
         """
+        import datetime
+        import socket
+
+        from torch.distributed import TCPStore
+        from torch.distributed.distributed_c10d import PrefixStore, ProcessGroupNCCL
+
         from vllm.v1.worker.gpu.spec_decode.ssd.draft_worker import (
             _draft_worker_entrypoint,
         )
 
-        init_q: Queue = mp.Queue()
+        # 1. Pick a free TCP port for the private rendezvous store.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as _s:
+            _s.bind(("127.0.0.1", 0))
+            _port: int = _s.getsockname()[1]
+        dist_init_addr = f"127.0.0.1:{_port}"
+        _timeout = datetime.timedelta(seconds=300)
 
+        # 2. Create the TCPStore on the target side (master=True) BEFORE
+        #    spawning the draft process so the store is already listening
+        #    when the draft tries to connect.
+        _store = TCPStore(
+            host_name="127.0.0.1",
+            port=_port,
+            world_size=2,
+            is_master=True,
+            timeout=_timeout,
+        )
+
+        # 3. Spawn the draft process.  It will call dist.init_process_group
+        #    with the same address (rank=1, world_size=2), which internally
+        #    creates a TCPStore(is_master=False) connecting to _store and then
+        #    builds a ProcessGroupNCCL using PrefixStore("", _store).
+        init_q: Queue = mp.Queue()
         self._draft_proc = mp.Process(
             target=_draft_worker_entrypoint,
             args=(
-                draft_rank,
+                1,             # rank of draft process (device index & dist rank)
                 self.vllm_config,
                 init_q,
                 dist_init_addr,
-                world_size,
+                2,             # world_size (target + draft = 2)
             ),
             daemon=True,
         )
         self._draft_proc.start()
-        # In the private 2-rank dist group: target=0, draft=1 (always).
-        # draft_rank here is the CUDA device index, NOT the dist group rank.
-        self._stored_draft_rank = 1  # dist rank of draft in private group
 
-        # The target and draft processes each independently call
-        # dist.init_process_group with the SAME rendezvous address, forming a
-        # private 2-rank group.  We cannot use dist.new_group here because that
-        # requires every process in the existing default world group to call it
-        # simultaneously.  Instead both sides bootstrap their own 2-rank group.
-        #
-        # NOTE: This requires PyTorch ≥ 2.0.  On older versions, only one call
-        # to init_process_group per process is allowed; a workaround using
-        # TCPStore + ProcessGroupNCCL directly is documented in the design doc.
-        dist.init_process_group(
-            backend="nccl",
-            init_method=f"tcp://{dist_init_addr}",
-            world_size=2,
-            rank=0,  # target is always rank 0 in the SSD private group
+        # 4. Build the same ProcessGroupNCCL on the target side (rank=0).
+        #    Both sides use PrefixStore("", ...) which is what
+        #    dist.init_process_group produces internally — the prefix key
+        #    separator is "/" so "" + "/" + key == "/key" on both sides.
+        self.async_pg = ProcessGroupNCCL(
+            PrefixStore("", _store),
+            rank=0,
+            size=2,
+            timeout=_timeout,
         )
-        # After init, the default group IS the 2-rank SSD group.
-        # We keep async_pg=None to signal "use the default group" (dist.send
-        # with group=None uses the default group).
-        # async_pg stays None — group=None in dist.send/recv uses the
-        # default group, which is now the private 2-rank SSD group.
-        self.async_pg = None
-        self._worker_ready = True  # draft process is live
+        self._stored_draft_rank = 1
+        self._worker_ready = True
 
-        # Block until the draft worker reports its kv-block count.
+        # 5. Block until the draft worker reports its kv-block count.
         self._draft_num_kv_blocks = init_q.get(timeout=300)
         init_q.close()
 
         logger.info(
-            "AsyncSSDProposer: draft worker (rank %d) ready. "
-            "kv_blocks=%d.",
-            draft_rank,
+            "AsyncSSDProposer: draft worker ready. kv_blocks=%d.",
             self._draft_num_kv_blocks,
         )
         return self._draft_num_kv_blocks

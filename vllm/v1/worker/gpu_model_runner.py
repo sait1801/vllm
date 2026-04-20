@@ -4882,16 +4882,11 @@ class GPUModelRunner(
 
         return draft_token_ids  # [B, K] int64
 
-    def init_ssd_draft_worker(
-        self,
-        dist_init_addr: str,
-        world_size: int,
-        draft_rank: int,
-    ) -> int:
+    def init_ssd_draft_worker(self) -> int:
         """Spawn the SSD draft worker process and return its kv-block count.
 
-        Must be called once after the distributed environment is initialized,
-        before the first call to ``execute_model``.  Only effective when
+        Must be called once after KV cache initialisation, before the first
+        call to ``execute_model``.  Only effective when
         ``speculative_config.draft_async=True``.
 
         Returns
@@ -4905,11 +4900,7 @@ class GPUModelRunner(
         ):
             return 0
         assert isinstance(self.drafter, AsyncSSDProposer)
-        return self.drafter.spawn_draft_worker(
-            dist_init_addr=dist_init_addr,
-            world_size=world_size,
-            draft_rank=draft_rank,
-        )
+        return self.drafter.spawn_draft_worker()
 
     def update_config(self, overrides: dict[str, Any]) -> None:
         allowed_config_names = {"load_config", "model_config"}
