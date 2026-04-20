@@ -617,10 +617,9 @@ class AsyncDraftWorker:
         )
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=self.dtype,
-            device_map={"": self.device},
+            dtype=self.dtype,
             trust_remote_code=True,
-        )
+        ).to(self.device)
         model.eval()
         logger.info("Draft model loaded (%d params).", sum(p.numel() for p in model.parameters()))
         return model, hf_config
