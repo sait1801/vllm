@@ -526,7 +526,16 @@ class GPUModelRunner(
                 | MedusaProposer
                 | ExtractHiddenStatesProposer
             )
-            if self.speculative_config.method == "ngram":
+            if self.speculative_config.draft_async:
+                # SSD (Speculative Speculative Decoding): async target-side
+                # proposer that communicates with a dedicated draft process.
+                # Must be checked before uses_draft_model() since draft_async
+                # is orthogonal to the method and would otherwise be shadowed.
+                self.drafter = AsyncSSDProposer(
+                    vllm_config=self.vllm_config,
+                    device=self.device,
+                )
+            elif self.speculative_config.method == "ngram":
                 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
                 self.drafter = NgramProposer(self.vllm_config)
@@ -573,13 +582,6 @@ class GPUModelRunner(
                     vllm_config=self.vllm_config, device=self.device
                 )
                 self.use_aux_hidden_state_outputs = True
-            elif self.speculative_config.draft_async:
-                # SSD (Speculative Speculative Decoding): async target-side
-                # proposer that communicates with a dedicated draft process.
-                self.drafter = AsyncSSDProposer(
-                    vllm_config=self.vllm_config,
-                    device=self.device,
-                )
             else:
                 raise ValueError(
                     "Unknown speculative decoding method: "
