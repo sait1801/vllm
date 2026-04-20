@@ -171,6 +171,7 @@ from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.ssd import AsyncSSDProposer
 from vllm.v1.spec_decode.ngram_proposer_gpu import (
     NgramProposerGPU,
     copy_num_valid_draft_tokens,
@@ -572,6 +573,13 @@ class GPUModelRunner(
                     vllm_config=self.vllm_config, device=self.device
                 )
                 self.use_aux_hidden_state_outputs = True
+            elif self.speculative_config.draft_async:
+                # SSD (Speculative Speculative Decoding): async target-side
+                # proposer that communicates with a dedicated draft process.
+                self.drafter = AsyncSSDProposer(
+                    vllm_config=self.vllm_config,
+                    device=self.device,
+                )
             else:
                 raise ValueError(
                     "Unknown speculative decoding method: "
@@ -591,6 +599,11 @@ class GPUModelRunner(
         self.use_async_spec_decode = (
             self.use_async_scheduling and self.num_spec_tokens > 0
         )
+
+        # SSD async state — populated during propose_draft_token_ids() and
+        # consumed by the rejection sampler on the following step.
+        self._ssd_cache_hits: torch.Tensor | None = None  # [B] int64
+        self._ssd_logits_q: torch.Tensor | None = None    # [B, K, V] dtype
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
@@ -3330,11 +3343,29 @@ class GPUModelRunner(
             draft_token_ids_cpu, _ = self._get_draft_token_ids_cpu()
             self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
 
+        # For SSD, pass the pre-cached draft logits and cache-hit mask so the
+        # rejection sampler can apply p/q acceptance on hits and strict
+        # acceptance on misses.
+        ssd_cache_hits: torch.Tensor | None = None
+        ssd_logits_q: torch.Tensor | None = None
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.draft_async
+            and self._ssd_cache_hits is not None
+        ):
+            ssd_cache_hits = self._ssd_cache_hits
+            ssd_logits_q = self._ssd_logits_q
+            # Clear after use — will be repopulated in the next propose step.
+            self._ssd_cache_hits = None
+            self._ssd_logits_q = None
+
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
-            None,  # draft_probs
+            None,  # draft_probs (SSD uses ssd_logits_q instead)
             logits,
             sampling_metadata,
+            ssd_cache_hits=ssd_cache_hits,
+            ssd_logits_q=ssd_logits_q,
         )
         return sampler_output
 
@@ -4730,7 +4761,153 @@ class GPUModelRunner(
                 slot_mappings=slot_mappings,
             )
 
+        elif spec_config.draft_async:
+            # SSD path: send cache-key to the async draft worker and receive
+            # pre-speculated tokens.  The draft worker pre-computed K-token
+            # continuations for all F fan-out recovery outcomes; we look up the
+            # one matching the actual recovery token from this step.
+            assert isinstance(self.drafter, AsyncSSDProposer)
+            draft_token_ids = self._propose_ssd(
+                scheduler_output=scheduler_output,
+                sampled_token_ids=sampled_token_ids,
+                sampling_metadata=sampling_metadata,
+            )
+
         return draft_token_ids
+
+    # ------------------------------------------------------------------
+    # SSD helpers
+    # ------------------------------------------------------------------
+
+    def _propose_ssd(
+        self,
+        scheduler_output: "SchedulerOutput",
+        sampled_token_ids: torch.Tensor | list[list[int]],
+        sampling_metadata: "SamplingMetadata",
+    ) -> torch.Tensor:
+        """Build SSD inputs and call AsyncSSDProposer.propose().
+
+        Returns draft_token_ids of shape [num_reqs, K] int64.
+        """
+        assert isinstance(self.drafter, AsyncSSDProposer)
+        spec_config = self.speculative_config
+        assert spec_config is not None
+
+        num_reqs = self.input_batch.num_reqs
+        K = spec_config.num_speculative_tokens
+
+        # ------------------------------------------------------------------
+        # 1. Recovery token IDs: the last accepted token per sequence.
+        #    For a padded-tensor batch this is sampled_token_ids[:, 0] (the
+        #    bonus token after rejection).  For a list-of-lists batch we take
+        #    the last element of each inner list.
+        # ------------------------------------------------------------------
+        if isinstance(sampled_token_ids, torch.Tensor):
+            # Shape [num_reqs, K+1]; column 0 is the bonus / recovery token.
+            recovery_token_ids = sampled_token_ids[:num_reqs, 0].to(
+                dtype=torch.int64, device=self.device
+            )
+        else:
+            # list[list[int]] — take last token of each sub-list.
+            rec = [ids[-1] if ids else 0 for ids in sampled_token_ids[:num_reqs]]
+            recovery_token_ids = torch.tensor(
+                rec, dtype=torch.int64, device=self.device
+            )
+
+        # ------------------------------------------------------------------
+        # 2. Batch index as stable integer seq_id.
+        # ------------------------------------------------------------------
+        seq_ids = torch.arange(num_reqs, dtype=torch.int64, device=self.device)
+
+        # ------------------------------------------------------------------
+        # 3. Context lengths (without spec tokens).
+        # ------------------------------------------------------------------
+        num_tokens = torch.from_numpy(
+            self.input_batch.num_tokens_no_spec[:num_reqs].copy()
+        ).to(dtype=torch.int64, device=self.device)
+
+        # last_accepted_lens = current context length (k_index in SSD paper).
+        last_accepted_lens = num_tokens.clone()
+
+        # ------------------------------------------------------------------
+        # 4. Draft block table (group 0 — first KV cache group).
+        # ------------------------------------------------------------------
+        # Use the target block table as a proxy for the draft block table until
+        # the draft worker manages its own KV cache.
+        draft_block_tables = (
+            self.input_batch.block_table[0]
+            .get_device_tensor(num_reqs)
+            .to(torch.int32)
+        )
+
+        # ------------------------------------------------------------------
+        # 5. Temperatures from SamplingMetadata.
+        # ------------------------------------------------------------------
+        if hasattr(sampling_metadata, "temperature") and (
+            sampling_metadata.temperature is not None
+        ):
+            temperatures = sampling_metadata.temperature[:num_reqs].to(
+                dtype=torch.float32, device=self.device
+            )
+        else:
+            temperatures = torch.ones(
+                num_reqs, dtype=torch.float32, device=self.device
+            )
+
+        # ------------------------------------------------------------------
+        # 6. EAGLE hidden states for recovery position (if applicable).
+        # ------------------------------------------------------------------
+        target_recovery_acts: torch.Tensor | None = None
+        if spec_config.use_eagle() and hasattr(self, "_ssd_eagle_acts"):
+            target_recovery_acts = self._ssd_eagle_acts
+
+        # ------------------------------------------------------------------
+        # 7. Call the proposer — NCCL exchange with draft worker.
+        # ------------------------------------------------------------------
+        draft_token_ids, logits_q, cache_hits = self.drafter.propose(
+            seq_ids=seq_ids,
+            last_accepted_lens=last_accepted_lens,
+            recovery_token_ids=recovery_token_ids,
+            num_tokens=num_tokens,
+            draft_block_tables=draft_block_tables,
+            temperatures=temperatures,
+            target_recovery_acts=target_recovery_acts,
+        )
+
+        # Stash for rejection sampler (Phase 7).
+        self._ssd_cache_hits = cache_hits        # [B] int64
+        self._ssd_logits_q = logits_q            # [B, K, V]
+
+        return draft_token_ids  # [B, K] int64
+
+    def init_ssd_draft_worker(
+        self,
+        dist_init_addr: str,
+        world_size: int,
+        draft_rank: int,
+    ) -> int:
+        """Spawn the SSD draft worker process and return its kv-block count.
+
+        Must be called once after the distributed environment is initialized,
+        before the first call to ``execute_model``.  Only effective when
+        ``speculative_config.draft_async=True``.
+
+        Returns
+        -------
+        int
+            Number of KV blocks allocated by the draft worker.
+        """
+        if (
+            self.speculative_config is None
+            or not self.speculative_config.draft_async
+        ):
+            return 0
+        assert isinstance(self.drafter, AsyncSSDProposer)
+        return self.drafter.spawn_draft_worker(
+            dist_init_addr=dist_init_addr,
+            world_size=world_size,
+            draft_rank=draft_rank,
+        )
 
     def update_config(self, overrides: dict[str, Any]) -> None:
         allowed_config_names = {"load_config", "model_config"}

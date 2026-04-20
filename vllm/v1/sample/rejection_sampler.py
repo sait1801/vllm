@@ -65,6 +65,9 @@ class RejectionSampler(nn.Module):
         # [num_tokens + batch_size, vocab_size]
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
+        # SSD-specific (optional): [batch_size] int64 and [batch_size, K, V]
+        ssd_cache_hits: torch.Tensor | None = None,
+        ssd_logits_q: torch.Tensor | None = None,
     ) -> SamplerOutput:
         """
         Args:
@@ -138,16 +141,32 @@ class RejectionSampler(nn.Module):
             sampling_metadata,
         )
 
-        output_token_ids = rejection_sample(
-            metadata.draft_token_ids,
-            metadata.num_draft_tokens,
-            metadata.max_spec_len,
-            metadata.cu_num_draft_tokens,
-            draft_probs,
-            target_logits,
-            bonus_token_ids,
-            sampling_metadata,
-        )
+        if ssd_cache_hits is not None:
+            # SSD: cache-hit-aware rejection sampling.
+            # Cache hits → probabilistic p/q acceptance.
+            # Cache misses → strict/greedy acceptance.
+            output_token_ids = ssd_rejection_sample(
+                draft_token_ids=metadata.draft_token_ids,
+                num_draft_tokens=metadata.num_draft_tokens,
+                max_spec_len=metadata.max_spec_len,
+                cu_num_draft_tokens=metadata.cu_num_draft_tokens,
+                ssd_logits_q=ssd_logits_q,
+                cache_hits=ssd_cache_hits,
+                target_logits=target_logits,
+                bonus_token_ids=bonus_token_ids,
+                sampling_metadata=sampling_metadata,
+            )
+        else:
+            output_token_ids = rejection_sample(
+                metadata.draft_token_ids,
+                metadata.num_draft_tokens,
+                metadata.max_spec_len,
+                metadata.cu_num_draft_tokens,
+                draft_probs,
+                target_logits,
+                bonus_token_ids,
+                sampling_metadata,
+            )
 
         logprobs_tensors = None
         if sampling_metadata.max_num_logprobs is not None:
@@ -848,3 +867,115 @@ def sample_recovered_tokens_kernel(
             recovered_id = v + local_id
 
     tl.store(output_token_ids_ptr + token_idx, recovered_id)
+
+
+# ---------------------------------------------------------------------------
+# SSD-specific rejection sampling
+# ---------------------------------------------------------------------------
+
+def ssd_rejection_sample(
+    # [num_tokens] int32/int64
+    draft_token_ids: torch.Tensor,
+    # [batch_size]
+    num_draft_tokens: list[int],
+    max_spec_len: int,
+    # [batch_size] cumulative
+    cu_num_draft_tokens: torch.Tensor,
+    # [batch_size, K, vocab_size] draft logits (None for full-miss batches)
+    ssd_logits_q: torch.Tensor | None,
+    # [batch_size] int64: 1 = cache hit, 0 = miss
+    cache_hits: torch.Tensor,
+    # [num_tokens, vocab_size]
+    target_logits: torch.Tensor,
+    # [batch_size, 1]
+    bonus_token_ids: torch.Tensor,
+    sampling_metadata: SamplingMetadata,
+) -> torch.Tensor:
+    """Cache-hit-aware SSD rejection sampling.
+
+    For *cache-hit* sequences the draft was drawn from the draft distribution
+    ``q``, so we apply the standard speculative decoding p/q acceptance test.
+
+    For *cache-miss* sequences the draft came from JIT speculation (greedy),
+    so the p/q ratio is not meaningful.  We fall back to strict (greedy)
+    acceptance: accept if ``draft_token == argmax(target_logits)``, else use
+    the target token.
+
+    Implementation uses two ``rejection_sample()`` passes and merges the
+    results per-row, avoiding a new Triton kernel.  This is correct but not
+    maximally efficient; a fused kernel is a future optimisation.
+    """
+    batch_size = len(num_draft_tokens)
+    device = target_logits.device
+
+    hit_mask = cache_hits.bool()   # [B]
+    all_miss = not hit_mask.any().item()
+    all_hit = hit_mask.all().item()
+
+    if all_miss or ssd_logits_q is None:
+        # Fast path: all misses → strict rejection everywhere.
+        return rejection_sample(
+            draft_token_ids,
+            num_draft_tokens,
+            max_spec_len,
+            cu_num_draft_tokens,
+            None,
+            target_logits,
+            bonus_token_ids,
+            sampling_metadata,
+        )
+
+    # Build flat draft_probs [num_tokens, V] from ssd_logits_q for hit rows.
+    # Miss rows are left as zeros (they will be overwritten by the merge).
+    num_tokens, vocab_size = target_logits.shape
+    K = ssd_logits_q.shape[1]
+    draft_probs = torch.zeros(
+        (num_tokens, vocab_size), dtype=torch.float32, device=device
+    )
+    offset = 0
+    for b in range(batch_size):
+        nd = num_draft_tokens[b]
+        if hit_mask[b] and nd > 0:
+            q_b = ssd_logits_q[b, :nd, :].float()  # [nd, V]
+            draft_probs[offset : offset + nd] = torch.softmax(q_b, dim=-1)
+        offset += nd
+
+    if all_hit:
+        # Fast path: all hits → standard probabilistic rejection.
+        return rejection_sample(
+            draft_token_ids,
+            num_draft_tokens,
+            max_spec_len,
+            cu_num_draft_tokens,
+            draft_probs,
+            target_logits,
+            bonus_token_ids,
+            sampling_metadata,
+        )
+
+    # Mixed batch: run both paths and merge per-row.
+    # Shape of each output: [batch_size, max_spec_len + 1]
+    soft_output = rejection_sample(
+        draft_token_ids,
+        num_draft_tokens,
+        max_spec_len,
+        cu_num_draft_tokens,
+        draft_probs,
+        target_logits,
+        bonus_token_ids,
+        sampling_metadata,
+    )
+    strict_output = rejection_sample(
+        draft_token_ids,
+        num_draft_tokens,
+        max_spec_len,
+        cu_num_draft_tokens,
+        None,
+        target_logits,
+        bonus_token_ids,
+        sampling_metadata,
+    )
+
+    # hit_mask: [B] → [B, 1] for broadcasting over max_spec_len+1 columns.
+    hits_2d = hit_mask.view(batch_size, 1)
+    return torch.where(hits_2d, soft_output, strict_output)

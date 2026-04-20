@@ -23,6 +23,18 @@ class SpecDecodeMetadata:
     # [num_tokens + batch_size]
     logits_indices: torch.Tensor
 
+    # SSD-specific fields (None for non-SSD spec-decode methods).
+    # [batch_size] int64: 1 = draft came from speculation cache (cache hit),
+    #                      0 = JIT speculation was used (cache miss).
+    ssd_cache_hits: torch.Tensor | None = None
+    # [batch_size, K, vocab_size]: draft model's log-probability distribution
+    # at each of the K draft positions.  Used for p/q ratio acceptance on
+    # cache-hit rows.  None for cache-miss rows or non-SSD paths.
+    ssd_draft_logits: torch.Tensor | None = None
+    # [batch_size, K] float32: temperatures used by the draft model when
+    # computing logits_q, required for calibrated p/q acceptance.
+    ssd_draft_temperatures: torch.Tensor | None = None
+
     def __post_init__(self):
         self.max_spec_len = max(self.num_draft_tokens)
 

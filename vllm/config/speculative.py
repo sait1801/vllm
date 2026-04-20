@@ -62,7 +62,7 @@ SpeculativeMethod = Literal[
     EagleModelTypes,
     NgramGPUTypes,
 ]
-RejectionSampleMethod = Literal["strict", "probabilistic", "synthetic"]
+RejectionSampleMethod = Literal["strict", "probabilistic", "synthetic", "ssd"]
 
 
 @config
@@ -194,6 +194,81 @@ class SpeculativeConfig:
     geometrically, calibrated so that the mean rate across all speculative
     positions equals this value. Only used when rejection_sample_method
     is 'synthetic'. Must be in [0, 1]."""
+
+    # -------------------------------------------------------------------------
+    # SSD (Speculative Speculative Decoding) — async draft on dedicated GPU
+    # -------------------------------------------------------------------------
+    draft_async: bool = False
+    """Run the draft model asynchronously on a dedicated GPU (the last rank).
+    While the target model verifies step T the draft pre-speculates all
+    *async_fan_out* possible recovery outcomes into a speculation cache so that
+    the next speculation request is served instantly (cache hit). Requires at
+    least 2 GPUs and method in ('draft_model', 'eagle', 'eagle3').
+    Automatically sets rejection_sample_method to 'ssd'."""
+
+    async_fan_out: int = 3
+    """F — number of top-k recovery tokens to pre-speculate per tree level.
+    The draft runs F^(K+1) tree branches so the cache covers all likely
+    outcomes. Higher values improve cache hit rate at the cost of more draft
+    compute per round."""
+
+    jit_speculate: bool = True
+    """On a cache miss (first step or cold start) fall back to running K
+    synchronous draft steps (JIT speculation) rather than returning random
+    tokens. Keeps output quality but sacrifices the latency benefit for that
+    one step."""
+
+    fan_out_list: list[int] | None = None
+    """Per-depth fan-out counts for the tree decode on a cache HIT.
+    Must have length num_speculative_tokens + 1.
+    Defaults to [async_fan_out] * (num_speculative_tokens + 1)."""
+
+    fan_out_list_miss: list[int] | None = None
+    """Per-depth fan-out counts for the tree decode on a cache MISS.
+    Must have length num_speculative_tokens + 1.
+    Defaults to [1] * (num_speculative_tokens + 1) (greedy, single path)."""
+
+    sampler_x: float | None = None
+    """Optional probability mass re-weighting factor applied to the top-F
+    draft distribution before the p/q acceptance ratio is computed (§3.3 of
+    the SSD paper). When None no re-weighting is applied."""
+
+    @model_validator(mode="after")
+    def _validate_ssd_fields(self) -> "SpeculativeConfig":
+        if not self.draft_async:
+            return self
+        # draft_async requires a draft-model-based method
+        async_compatible = {"draft_model", "eagle", "eagle3"}
+        if self.method not in async_compatible:
+            raise ValueError(
+                f"draft_async=True requires method in {async_compatible}, "
+                f"got '{self.method}'."
+            )
+        # Force SSD rejection sampling when async mode is on
+        if self.rejection_sample_method == "strict":
+            object.__setattr__(self, "rejection_sample_method", "ssd")
+        # Auto-populate fan_out_list / fan_out_list_miss once K is known
+        K = self.num_speculative_tokens
+        if K is not None:
+            depth = K + 1
+            if self.fan_out_list is None:
+                object.__setattr__(
+                    self, "fan_out_list", [self.async_fan_out] * depth
+                )
+            elif len(self.fan_out_list) != depth:
+                raise ValueError(
+                    f"fan_out_list must have length num_speculative_tokens+1"
+                    f" ({depth}), got {len(self.fan_out_list)}."
+                )
+            if self.fan_out_list_miss is None:
+                object.__setattr__(self, "fan_out_list_miss", [1] * depth)
+            elif len(self.fan_out_list_miss) != depth:
+                raise ValueError(
+                    f"fan_out_list_miss must have length "
+                    f"num_speculative_tokens+1 ({depth}), "
+                    f"got {len(self.fan_out_list_miss)}."
+                )
+        return self
 
     def compute_hash(self) -> str:
         """
