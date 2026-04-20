@@ -286,7 +286,7 @@ class AsyncSSDProposer:
         self._meta_buf[0] = B
         self._meta_buf[1] = K
         self._meta_buf[2] = F
-        dist.send(self._meta_buf, dst=self._draft_rank, group=self.async_pg)
+        self._pg_send(self._meta_buf)
 
         # --- Build cache keys: [B, 3] = (seq_id, k_index, recovery_token) ---
         cache_keys = torch.stack(
@@ -304,21 +304,17 @@ class AsyncSSDProposer:
             bt_padded.to(torch.int64).reshape(-1),  # B*max_blocks
             temps_as_int.reshape(-1),        # B
         ])  # total: 3B + B + B*max_blocks + B = (5+max_blocks)*B
-        dist.send(fused, dst=self._draft_rank, group=self.async_pg)
+        self._pg_send(fused)
 
         # --- Optionally send EAGLE hidden states ---
         if self.use_eagle and target_recovery_acts is not None:
-            dist.send(
-                target_recovery_acts.contiguous(),
-                dst=self._draft_rank,
-                group=self.async_pg,
-            )
+            self._pg_send(target_recovery_acts)
 
         # --- Receive response ---
         # fused_response: [cache_hits(B) | out_tokens(B*K)] = B*(K+1) int64
         resp_len = B + B * K
         fused_resp = torch.empty(resp_len, dtype=torch.int64, device=self.device)
-        dist.recv(fused_resp, src=self._draft_rank, group=self.async_pg)
+        self._pg_recv(fused_resp)
 
         cache_hits = fused_resp[:B]                         # [B]
         draft_token_ids = fused_resp[B:].view(B, K)        # [B, K]
@@ -327,7 +323,7 @@ class AsyncSSDProposer:
         logits_q = torch.empty(
             (B, K, self.vocab_size), dtype=self.dtype, device=self.device
         )
-        dist.recv(logits_q, src=self._draft_rank, group=self.async_pg)
+        self._pg_recv(logits_q)
 
         return draft_token_ids, logits_q, cache_hits
 
@@ -359,9 +355,7 @@ class AsyncSSDProposer:
         self._prefill_meta_buf[2] = max_blocks
         self._prefill_meta_buf[3] = int(self.use_eagle and eagle_acts is not None)
         self._prefill_meta_buf[4] = act_dim
-        dist.send(
-            self._prefill_meta_buf, dst=self._draft_rank, group=self.async_pg
-        )
+        self._pg_send(self._prefill_meta_buf)
 
         # --- Fuse payload: input_ids(total_tokens) | num_tokens(B) | bt(B*max_blocks) ---
         bt_padded = _pad_block_table(block_table, max_blocks)
@@ -370,11 +364,11 @@ class AsyncSSDProposer:
             num_tokens.to(torch.int64).reshape(-1),
             bt_padded.to(torch.int64).reshape(-1),
         ])
-        dist.send(fused, dst=self._draft_rank, group=self.async_pg)
+        self._pg_send(fused)
 
         # --- Optionally send EAGLE hidden states ---
         if self.use_eagle and eagle_acts is not None:
-            dist.send(eagle_acts.contiguous(), dst=self._draft_rank, group=self.async_pg)
+            self._pg_send(eagle_acts)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -388,10 +382,24 @@ class AsyncSSDProposer:
         """
         return self._stored_draft_rank
 
+    def _pg_send(self, tensor: torch.Tensor) -> None:
+        """Send *tensor* to draft rank using the raw ProcessGroup API.
+
+        Unlike ``dist.send``, this does NOT require the process group to be
+        registered in PyTorch's global group map, which is required when the
+        group is created via ``ProcessGroupNCCL(...)`` directly rather than
+        via ``dist.new_group()``.
+        """
+        self.async_pg.send([tensor.contiguous()], self._draft_rank, 0).wait()
+
+    def _pg_recv(self, tensor: torch.Tensor) -> None:
+        """Receive into *tensor* from draft rank using the raw ProcessGroup API."""
+        self.async_pg.recv([tensor], self._draft_rank, 0).wait()
+
     def _send_cmd(self, cmd: int) -> None:
         """Send a single int64 command scalar to the draft worker."""
         self._cmd_buf[0] = cmd
-        dist.send(self._cmd_buf, dst=self._draft_rank, group=self.async_pg)
+        self._pg_send(self._cmd_buf)
 
     @property
     def num_draft_kv_blocks(self) -> int:

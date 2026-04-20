@@ -16,6 +16,22 @@ import torch
 import torch.distributed as dist
 
 
+def _pg_send(pg: dist.ProcessGroup, tensor: torch.Tensor, dst: int) -> None:
+    """Send *tensor* to *dst* using the raw ProcessGroup API.
+
+    Unlike ``dist.send``, this does NOT require the process group to be
+    registered in PyTorch's global group map, which is required when the
+    group is created via ``ProcessGroupNCCL(...)`` directly rather than via
+    ``dist.new_group()``.
+    """
+    pg.send([tensor.contiguous()], dst, 0).wait()
+
+
+def _pg_recv(pg: dist.ProcessGroup, tensor: torch.Tensor, src: int) -> None:
+    """Receive into *tensor* from *src* using the raw ProcessGroup API."""
+    pg.recv([tensor], src, 0).wait()
+
+
 def send_int64(
     pg: dist.ProcessGroup,
     dst: int,
@@ -28,7 +44,7 @@ def send_int64(
     """
     flat_parts = [t.reshape(-1) for t in tensors]
     fused = torch.cat(flat_parts)
-    dist.send(fused, dst=dst, group=pg)
+    _pg_send(pg, fused, dst)
 
 
 def recv_int64(
@@ -41,7 +57,7 @@ def recv_int64(
     *src* and return it.  The caller is responsible for slicing / reshaping.
     """
     buf = torch.empty(total_length, dtype=torch.int64, device=device)
-    dist.recv(buf, src=src, group=pg)
+    _pg_recv(pg, buf, src)
     return buf
 
 
@@ -60,7 +76,7 @@ def send_cmd(
     if _buf is None:
         _buf = torch.zeros(1, dtype=torch.int64, device=device)
     _buf[0] = cmd
-    dist.send(_buf, dst=dst, group=pg)
+    _pg_send(pg, _buf, dst)
     return _buf
 
 
@@ -76,5 +92,5 @@ def recv_cmd(
     """
     if _buf is None:
         _buf = torch.zeros(1, dtype=torch.int64, device=device)
-    dist.recv(_buf, src=src, group=pg)
+    _pg_recv(pg, _buf, src)
     return int(_buf[0].item()), _buf

@@ -47,6 +47,8 @@ import torch.distributed as dist
 
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu.spec_decode.ssd.nccl_comm import (
+    _pg_recv,
+    _pg_send,
     recv_cmd,
     recv_int64,
 )
@@ -231,7 +233,7 @@ class AsyncDraftWorker:
     def _handle_prefill(self) -> None:
         """Receive a prefill payload and run the draft model in prefill mode."""
         meta_buf = torch.zeros(5, dtype=torch.int64, device=self.device)
-        dist.recv(meta_buf, src=0, group=self.async_pg)
+        _pg_recv(self.async_pg, meta_buf, 0)
         total_tokens, B, max_blocks, use_eagle_flag, eagle_act_dim = (
             meta_buf.tolist()
         )
@@ -256,7 +258,7 @@ class AsyncDraftWorker:
                 dtype=self.dtype,
                 device=self.device,
             )
-            dist.recv(eagle_acts, src=0, group=self.async_pg)
+            _pg_recv(self.async_pg, eagle_acts, 0)
 
         self._run_prefill(input_ids, num_tokens, block_table, eagle_acts)
 
@@ -270,7 +272,7 @@ class AsyncDraftWorker:
         """
         # --- Receive request ---
         meta = torch.zeros(3, dtype=torch.int64, device=self.device)
-        dist.recv(meta, src=0, group=self.async_pg)
+        _pg_recv(self.async_pg, meta, 0)
         B, K, F = (int(x) for x in meta.tolist())
 
         max_blocks = self.vllm_config.cache_config.num_gpu_blocks_override or 512
@@ -295,7 +297,7 @@ class AsyncDraftWorker:
             target_recovery_acts = torch.zeros(
                 (B, act_dim), dtype=self.dtype, device=self.device
             )
-            dist.recv(target_recovery_acts, src=0, group=self.async_pg)
+            _pg_recv(self.async_pg, target_recovery_acts, 0)
 
         # --- Lookup / JIT speculate ---
         cache_hits, out_tokens, out_logits, _out_acts = self.cache.lookup(cache_keys)
@@ -310,8 +312,8 @@ class AsyncDraftWorker:
         fused_response = torch.cat(
             [cache_hits.reshape(-1), out_tokens.reshape(-1).to(torch.int64)]
         )
-        dist.send(fused_response, dst=0, group=self.async_pg)
-        dist.send(out_logits[:, : self.K, :].contiguous(), dst=0, group=self.async_pg)
+        _pg_send(self.async_pg, fused_response, 0)
+        _pg_send(self.async_pg, out_logits[:, : self.K, :].contiguous(), 0)
 
         # --- Build next cache (glue decode -> fork -> tree decode -> populate) ---
         self.cache.reset()
