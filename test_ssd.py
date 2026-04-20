@@ -27,6 +27,22 @@ sys.path.insert(0, str(VLLM_REF))
 
 import torch
 
+
+def _get_device() -> torch.device:
+    """Return cuda:0 if CUDA is usable, else cpu.
+
+    Catches driver/version mismatches (e.g. torch built for CUDA 13 on a
+    machine with a CUDA 12.x driver) so tests degrade gracefully to CPU.
+    """
+    try:
+        if torch.cuda.is_available():
+            torch.zeros(1, device="cuda:0")  # force driver init
+            return torch.device("cuda:0")
+    except Exception:
+        pass
+    return torch.device("cpu")
+
+
 # ---------------------------------------------------------------------------
 # Minimal stubs for vllm imports that our modules reference at import-time
 # but that we don't need to actually run.
@@ -93,7 +109,7 @@ def test_speculation_cache():
     )
     SpeculationCache = spec.SpeculationCache
 
-    device = torch.device("cuda:0")
+    device = _get_device()
     K = 4        # speculative tokens per request
     V = 256      # tiny vocab for speed
     B = 8        # batch size
@@ -308,7 +324,7 @@ def test_ssd_rejection_sample():
     # `rejection_sample`, so we'll implement a minimal stand-alone version
     # that mirrors the logic exactly.
 
-    device = torch.device("cuda:0")
+    device = _get_device()
     B, K, V = 8, 4, 512
     dtype = torch.float32
 
