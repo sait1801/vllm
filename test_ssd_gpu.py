@@ -148,8 +148,8 @@ def _draft_process(store_file: str, result_q: mp.Queue) -> None:
     # Load draft model
     print("  [draft] Loading draft model ...", flush=True)
     model = AutoModelForCausalLM.from_pretrained(
-        DRAFT_MODEL, torch_dtype=DTYPE, device_map={"": device}
-    )
+        DRAFT_MODEL, dtype=DTYPE
+    ).to(device)
     model.eval()
     vocab_size = model.config.vocab_size
     fan_out_list = [F] * (K + 1)   # [F, F, F, F] — K+1 depths
