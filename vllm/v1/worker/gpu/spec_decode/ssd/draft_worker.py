@@ -36,6 +36,7 @@ Architecture
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import time
 from multiprocessing import Queue
@@ -55,6 +56,34 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 logger = init_logger(__name__)
+
+
+@dataclasses.dataclass
+class DraftWorkerBootstrap:
+    """Minimal, pickle-safe config passed to the draft worker subprocess.
+
+    Passing the full ``VllmConfig`` to the subprocess via ``mp.Process``
+    with the ``spawn`` start method triggers PyTorch's CUDA tensor
+    serialisation and can OOM the GPU (or fail if CUDA tensors embedded in
+    vllm_config exceed available device memory).  This dataclass contains
+    only plain Python values extracted before spawning.
+    """
+    # Model
+    draft_model: str
+    draft_dtype: str               # e.g. "float16" or "bfloat16"
+    draft_quantization: str | None # e.g. "fp8" or None
+    # Speculative-decode params
+    num_speculative_tokens: int
+    async_fan_out: int
+    jit_speculate: bool
+    fan_out_list: list[int] | None
+    fan_out_list_miss: list[int] | None
+    spec_method: str               # "draft_model", "eagle", …
+    # KV cache sizing
+    block_size: int
+    num_gpu_blocks_override: int | None
+    # CUDA device for the draft worker (index, not dist-rank)
+    cuda_device_index: int
 
 # ---------------------------------------------------------------------------
 # Command constants (shared with AsyncSSDProposer)
@@ -91,44 +120,36 @@ class AsyncDraftWorker:
 
     def __init__(
         self,
-        vllm_config: "VllmConfig",
-        rank: int,
+        bootstrap: DraftWorkerBootstrap,
         init_q: Queue,
         async_pg: dist.ProcessGroup,
     ) -> None:
-        self.vllm_config = vllm_config
-        self.rank = rank
+        self.bootstrap = bootstrap
         self.async_pg = async_pg
-        self.device = torch.device(f"cuda:{rank}")
+        # Use the explicit CUDA device index from bootstrap (not dist-rank).
+        self.device = torch.device(f"cuda:{bootstrap.cuda_device_index}")
 
-        spec_cfg = vllm_config.speculative_config
-        assert spec_cfg is not None and spec_cfg.draft_async, (
-            "AsyncDraftWorker requires speculative_config.draft_async=True"
-        )
-        self.spec_cfg = spec_cfg
-        self.K: int = spec_cfg.num_speculative_tokens
-        self.async_fan_out: int = spec_cfg.async_fan_out
-        self.jit_speculate_enabled: bool = spec_cfg.jit_speculate
-        self.fan_out_list: list[int] = spec_cfg.fan_out_list or (
+        self.K: int = bootstrap.num_speculative_tokens
+        self.async_fan_out: int = bootstrap.async_fan_out
+        self.jit_speculate_enabled: bool = bootstrap.jit_speculate
+        self.fan_out_list: list[int] = bootstrap.fan_out_list or (
             [self.async_fan_out] * (self.K + 1)
         )
-        self.fan_out_list_miss: list[int] = spec_cfg.fan_out_list_miss or (
+        self.fan_out_list_miss: list[int] = bootstrap.fan_out_list_miss or (
             [1] * (self.K + 1)
         )
         # MQ_LEN = total number of forked token candidates per sequence per step
         self.MQ_LEN: int = sum(self.fan_out_list)
 
-        # Dtype from the engine config (used for logits buffers).
-        self.dtype: torch.dtype = (
-            getattr(vllm_config.model_config, "dtype", None) or torch.float16
-        )
+        # Dtype for logits buffers.
+        self.dtype: torch.dtype = getattr(torch, bootstrap.draft_dtype, torch.float16)
 
         # ------------------------------------------------------------------
         # Load the draft model using HuggingFace transformers.
         # ------------------------------------------------------------------
         self._model, self.draft_hf_config = self._load_draft_model()
         self.vocab_size: int = self.draft_hf_config.vocab_size
-        self.use_eagle: bool = spec_cfg.method in ("eagle", "eagle3")
+        self.use_eagle: bool = bootstrap.spec_method in ("eagle", "eagle3")
         self.hidden_size: int | None = (
             getattr(self.draft_hf_config, "hidden_size", None)
             if self.use_eagle else None
@@ -588,7 +609,7 @@ class AsyncDraftWorker:
         """
         from transformers import AutoConfig, AutoModelForCausalLM  # type: ignore
 
-        model_name = self.spec_cfg.draft_model_config.model
+        model_name = self.bootstrap.draft_model
         logger.info("Loading draft model '%s' on %s ...", model_name, self.device)
 
         hf_config = AutoConfig.from_pretrained(
@@ -611,13 +632,12 @@ class AsyncDraftWorker:
         ``past_key_values`` internally.  We return a nominal block count so
         that the parent can size its block manager accordingly.
         """
-        cache_cfg = self.vllm_config.cache_config
-        block_size = cache_cfg.block_size
+        block_size = self.bootstrap.block_size
 
         gpu_mem = torch.cuda.get_device_properties(self.device).total_memory
         # Reserve 15 % of VRAM as an estimate for the HF rolling KV cache.
         usable = int(gpu_mem * 0.15)
-        hf = self.spec_cfg.draft_model_config.hf_config
+        hf = self.draft_hf_config
         num_layers = getattr(hf, "num_hidden_layers", 32)
         num_kv_heads = getattr(hf, "num_key_value_heads", getattr(hf, "num_attention_heads", 8))
         head_dim = getattr(hf, "head_dim", 64)
@@ -638,11 +658,9 @@ class AsyncDraftWorker:
 # ---------------------------------------------------------------------------
 
 def _draft_worker_entrypoint(
-    rank: int,
-    vllm_config: "VllmConfig",
+    bootstrap: DraftWorkerBootstrap,
     init_q: Queue,
     dist_init_addr: str,
-    world_size: int,
 ) -> None:
     """Called by ``multiprocessing.Process`` to start the draft process.
 
@@ -651,16 +669,12 @@ def _draft_worker_entrypoint(
 
     Parameters
     ----------
-    rank:
-        CUDA device index for this worker (e.g. 1 for the second GPU).
-    vllm_config:
-        Full engine configuration.
+    bootstrap:
+        Minimal pickle-safe config for the draft worker.
     init_q:
         Queue used to send the KV-block count to the parent process.
     dist_init_addr:
         ``"host:port"`` rendezvous address.
-    world_size:
-        Always 2 (target + draft) in the private SSD group.
     """
     os.environ.setdefault("MASTER_ADDR", dist_init_addr.split(":")[0])
     os.environ.setdefault("MASTER_PORT", dist_init_addr.split(":")[1])
@@ -673,8 +687,7 @@ def _draft_worker_entrypoint(
     )
 
     worker = AsyncDraftWorker(
-        vllm_config=vllm_config,
-        rank=rank,
+        bootstrap=bootstrap,
         init_q=init_q,
         async_pg=None,  # None = use the default private 2-rank group
     )

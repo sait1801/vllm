@@ -141,6 +141,7 @@ class AsyncSSDProposer:
         from torch.distributed.distributed_c10d import PrefixStore, ProcessGroupNCCL
 
         from vllm.v1.worker.gpu.spec_decode.ssd.draft_worker import (
+            DraftWorkerBootstrap,
             _draft_worker_entrypoint,
         )
 
@@ -164,25 +165,37 @@ class AsyncSSDProposer:
             wait_for_workers=False,
         )
 
-        # 3. Spawn the draft process.  It will call dist.init_process_group
-        #    with the same address (rank=1, world_size=2), which internally
-        #    creates a TCPStore(is_master=False) connecting to _store and then
-        #    builds a ProcessGroupNCCL using PrefixStore("", _store).
+        # 3. Build a minimal, pickle-safe bootstrap config for the draft worker.
+        #    Passing the full vllm_config causes an OOM during mp.Process spawn
+        #    because PyTorch serializes any embedded CUDA tensors into the child.
+        spec_cfg = self.spec_cfg
+        vllm_cfg = self.vllm_config
+        bootstrap = DraftWorkerBootstrap(
+            draft_model=spec_cfg.draft_model_config.model,
+            draft_dtype=str(vllm_cfg.model_config.dtype).replace("torch.", ""),
+            draft_quantization=getattr(spec_cfg, "quantization", None),
+            num_speculative_tokens=spec_cfg.num_speculative_tokens,
+            async_fan_out=spec_cfg.async_fan_out,
+            jit_speculate=spec_cfg.jit_speculate,
+            fan_out_list=getattr(spec_cfg, "fan_out_list", None),
+            fan_out_list_miss=getattr(spec_cfg, "fan_out_list_miss", None),
+            spec_method=spec_cfg.method,
+            block_size=vllm_cfg.cache_config.block_size,
+            num_gpu_blocks_override=vllm_cfg.cache_config.num_gpu_blocks_override,
+            # Draft shares GPU 0 with the target on single-GPU setups.
+            cuda_device_index=self.device.index or 0,
+        )
+
+        # 4. Spawn the draft process with the lightweight bootstrap only.
         init_q: Queue = mp.Queue()
         self._draft_proc = mp.Process(
             target=_draft_worker_entrypoint,
-            args=(
-                1,             # rank of draft process (device index & dist rank)
-                self.vllm_config,
-                init_q,
-                dist_init_addr,
-                2,             # world_size (target + draft = 2)
-            ),
+            args=(bootstrap, init_q, dist_init_addr),
             daemon=True,
         )
         self._draft_proc.start()
 
-        # 4. Build the same ProcessGroupNCCL on the target side (rank=0).
+        # 5. Build the same ProcessGroupNCCL on the target side (rank=0).
         #    Both sides use PrefixStore("", ...) which is what
         #    dist.init_process_group produces internally — the prefix key
         #    separator is "/" so "" + "/" + key == "/key" on both sides.
@@ -195,7 +208,7 @@ class AsyncSSDProposer:
         self._stored_draft_rank = 1
         self._worker_ready = True
 
-        # 5. Block until the draft worker reports its kv-block count.
+        # 6. Block until the draft worker reports its kv-block count.
         self._draft_num_kv_blocks = init_q.get(timeout=300)
         init_q.close()
 
