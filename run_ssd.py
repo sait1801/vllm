@@ -53,7 +53,7 @@ llm = LLM(
         "draft_async": True,         # activates SSD speculation cache
         "async_fan_out": 3,
         "jit_speculate": True,
-        "speculative_model_quantization": "fp8",
+        "quantization": "fp8",       # draft model quantization
     },
 )
 
