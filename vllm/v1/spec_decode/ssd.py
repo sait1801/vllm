@@ -71,7 +71,7 @@ class AsyncSSDProposer:
         self.async_fan_out: int = spec_cfg.async_fan_out
 
         # Vocab size from draft model config.
-        self.vocab_size: int = spec_cfg.draft_model_config.vocab_size
+        self.vocab_size: int = spec_cfg.draft_model_config.get_vocab_size()
         self.dtype: torch.dtype = vllm_config.model_config.dtype
 
         # EAGLE hidden state size (None if not EAGLE).
